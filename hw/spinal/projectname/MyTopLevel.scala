@@ -1,6 +1,7 @@
 package projectname
 
 import spinal.core._
+import scala.language.postfixOps
 
 // Hardware definition
 case class MyTopLevel() extends Component {
