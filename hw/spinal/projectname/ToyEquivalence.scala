@@ -142,7 +142,13 @@ case class MultiplierImpl() extends Component {
       adder.io.y := U(8 bits, (6 downto 3) -> Mux(b(3), a, U(0)), default -> false)
       r := adder.io.r
       a := adder.io.r(3 downto 0)
+
+      // correct:
       b := adder.io.r(7 downto 4)
+      // deliberate bug: drop highest bit of result
+      // b := U(4 bits, 3 -> false, (2 downto 0) -> adder.io.r(6 downto 4))
+      // TODO understand output of `yosys-witness display ./simWorkspace/unamed/unamed_bmc/engine_0/trace.yw`
+
       state := StateType.READY
     }
   }
@@ -236,4 +242,49 @@ object MultiplierVerilog extends App {
   Config.spinal.generateVerilog(MultiplierSpec())
   Config.spinal.generateVerilog(MultiplierImpl())
   Config.spinal.generateVerilog(Adder())
+}
+
+case class MultiplierFormalBench() extends Component {
+  val io = new Bundle {
+    val addr = in UInt (2 bits)
+    val isWrite = in Bool()
+    val valueIn = in UInt (4 bits)
+    val comparisonOk = out Bool()
+  }
+
+  val spec = MultiplierSpec()
+  val impl = MultiplierImpl()
+  (spec.io.addr, spec.io.isWrite, spec.io.valueIn) := (io.addr, io.isWrite, io.valueIn)
+  (impl.io.addr, impl.io.isWrite, impl.io.valueIn) := (io.addr, io.isWrite, io.valueIn)
+  io.comparisonOk := (io.isWrite || (spec.io.valueOut === impl.io.valueOut))
+}
+
+import spinal.core.formal._
+
+object MultiplierFormalRunner extends App {
+  FormalConfig
+    //.withProve() // causes yices to run forever (at least >1min)
+    //.withBMC(100) // runs forever
+    //.withBMC(20) // 20 cycles takes a few minutes
+    .withBMC(12) // succeeds quickly
+    .doVerify(new Component {
+      val dut = FormalDut(MultiplierFormalBench())
+
+      // Ensure the formal test start with a reset
+      // TODO where does this global variable clockDomain come from?
+      assumeInitial(clockDomain.isResetActive)
+
+      // Provide some stimulus
+      anyseq(dut.io.addr)
+      anyseq(dut.io.isWrite)
+      anyseq(dut.io.valueIn)
+
+      // to avoid disagreeing outputs before computation has taken place
+      // TODO how can we specify the valid stimuli from the external world? (eg exclude reads as long as uninitialized)
+      assumeInitial(dut.spec.a === dut.impl.a)
+      assumeInitial(dut.spec.b === dut.impl.b)
+
+      // Check the state initial value and increment
+      assert(dut.io.comparisonOk)
+    })
 }
