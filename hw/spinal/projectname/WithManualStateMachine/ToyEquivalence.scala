@@ -1,8 +1,8 @@
-package projectname
+package projectname.WithManualStateMachine
 
+import projectname.Config
 import spinal.core._
 import spinal.core.sim.SimDataPimper
-import spinal.lib.fsm._
 
 import scala.language.postfixOps
 
@@ -10,48 +10,25 @@ object StateType extends SpinalEnum {
   val READY, PROCESSING0, PROCESSING1, PROCESSING2 = newElement()
 }
 
-object SpecState extends SpinalEnum {
-  val READY, PROCESSING = newElement()
-}
-
-case class MultiplierIO() extends Bundle {
-  // 0: first argument / result
-  // 1: second argument / result overflow
-  // 2: isProcessing (status)
-  // 3: unused
-  val addr = in UInt (2 bits)
-
-  // whether it's an MMIO read or write
-  val isWrite = in Bool()
-
-  // is isWrite, the value to be written, else unused
-  val valueIn = in UInt (4 bits)
-
-  // if !isWrite, the result of the read
-  val valueOut = out UInt (4 bits)
-}
-
-
 case class MultiplierSpec() extends Component {
-  val io = MultiplierIO()
+  val io = new Bundle {
+    // 0: first argument / result
+    // 1: second argument / result overflow
+    // 2: isProcessing (status)
+    // 3: unused
+    val addr = in UInt (2 bits)
 
-  /*
-  val fsm = new StateMachine {
-    val ready: State = new State with EntryPoint {
-      whenIsActive(goto(processing))
-    }
-    val processing: StateDelay = new StateDelay(cyclesCount=3) {
-      whenCompleted {
-        goto(ready)
-      }
-    }
+    // whether it's an MMIO read or write
+    val isWrite = in Bool()
+
+    // is isWrite, the value to be written, else unused
+    val valueIn = in UInt (4 bits)
+
+    // if !isWrite, the result of the read
+    val valueOut = out UInt (4 bits)
   }
 
-  val test: Bool = fsm.isActive(fsm.ready)
-  val test2: Bool = fsm.isActive(fsm.processing) && fsm.processing.cache.value === 2
-*/
-
-  val state = Reg(SpecState) init SpecState.READY
+  val state = Reg(StateType) init StateType.READY
   val a = Reg(UInt (4 bits))
   val b = Reg(UInt (4 bits))
 
@@ -94,7 +71,23 @@ case class MultiplierSpec() extends Component {
 }
 
 case class MultiplierImpl() extends Component {
-  val io = MultiplierIO()
+  // same I/O as spec -- TODO what's a Bundle and can we share it?
+  val io = new Bundle {
+    // 0: first argument / result
+    // 1: second argument / result overflow
+    // 2: isProcessing (status)
+    // 3: unused
+    val addr = in UInt (2 bits)
+
+    // whether it's an MMIO read or write
+    val isWrite = in Bool()
+
+    // is isWrite, the value to be written, else unused
+    val valueIn = in UInt (4 bits)
+
+    // if !isWrite, the result of the read
+    val valueOut = out UInt (4 bits)
+  }
 
   val state = Reg(StateType) init StateType.READY
   val a = Reg(UInt (4 bits))
@@ -152,9 +145,9 @@ case class MultiplierImpl() extends Component {
       a := adder.io.r(3 downto 0)
 
       // correct:
-      // b := adder.io.r(7 downto 4)
+      b := adder.io.r(7 downto 4)
       // deliberate bug: drop highest bit of result
-      b := (U"1'b0" ## adder.io.r(6 downto 4)).asUInt
+      // b := U(4 bits, 3 -> false, (2 downto 0) -> adder.io.r(6 downto 4))
       // TODO understand output of `yosys-witness display ./simWorkspace/unamed/unamed_bmc/engine_0/trace.yw`
 
       state := StateType.READY
@@ -207,7 +200,7 @@ object MultiplierImplSim extends App {
       dut.io.addr #= 2
       dut.io.isWrite #= false
       // we're testing a Mealy machine (ie output depends on current inputs),
-      // so give it half a cycle of time to propagate
+      // so give it half a cycle of time to propagate -- TODO is this kosher?
       dut.clockDomain.waitFallingEdge()
       val isProcessing = dut.io.valueOut.toInt
       println(s"count: ${count}, isProcessing: ${isProcessing}")
@@ -262,54 +255,12 @@ case class MultiplierFormalBench() extends Component {
 
   val spec = MultiplierSpec()
   val impl = MultiplierImpl()
-
-  spec.io.assignSomeByName(io)
-  impl.io.assignSomeByName(io)
-
+  (spec.io.addr, spec.io.isWrite, spec.io.valueIn) := (io.addr, io.isWrite, io.valueIn)
+  (impl.io.addr, impl.io.isWrite, impl.io.valueIn) := (io.addr, io.isWrite, io.valueIn)
   io.comparisonOk := (io.isWrite || (spec.io.valueOut === impl.io.valueOut))
 }
 
 import spinal.core.formal._
-
-object MultiplierFormalStepRunner extends App {
-
-  def abstractImplState(implState: StateType.C): SpecState.E =
-    implState.mux(
-      StateType.READY -> SpecState.READY,
-      default -> SpecState.PROCESSING
-    )
-
-  def R(spec: MultiplierSpec, impl: MultiplierImpl): Bool = {
-    abstractImplState(impl.state) === spec.state &&
-      impl.a === spec.a && impl.b === spec.b
-  }
-
-  FormalConfig
-    //.withProve() // causes yices to run forever (at least >1min)
-    //.withBMC(100) // runs forever
-    //.withBMC(20) // 20 cycles takes a few minutes
-    .withBMC(12) // succeeds quickly
-    .doVerify(new Component {
-      val dut = FormalDut(MultiplierFormalBench())
-
-      // Ensure the formal test start with a reset
-      assumeInitial(clockDomain.isResetActive)
-      assumeInitial(R(dut.spec, dut.impl))
-
-      // Provide some stimulus
-      anyseq(dut.io.addr)
-      anyseq(dut.io.isWrite)
-      anyseq(dut.io.valueIn)
-
-      // to avoid disagreeing outputs before computation has taken place
-      // TODO how can we specify the valid stimuli from the external world? (eg exclude reads as long as uninitialized)
-      assumeInitial(dut.spec.a === dut.impl.a)
-      assumeInitial(dut.spec.b === dut.impl.b)
-
-      // Check the state initial value and increment
-      assert(dut.io.comparisonOk)
-    })
-}
 
 object MultiplierFormalRunner extends App {
   FormalConfig
@@ -321,6 +272,7 @@ object MultiplierFormalRunner extends App {
       val dut = FormalDut(MultiplierFormalBench())
 
       // Ensure the formal test start with a reset
+      // TODO where does this global variable clockDomain come from?
       assumeInitial(clockDomain.isResetActive)
 
       // Provide some stimulus
