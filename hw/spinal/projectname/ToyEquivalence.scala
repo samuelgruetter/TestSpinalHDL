@@ -14,6 +14,18 @@ object SpecState extends SpinalEnum {
   val READY, PROCESSING = newElement()
 }
 
+case class SpecStateData() extends Bundle {
+  val state = SpecState()
+  val a = UInt (4 bits)
+  val b = UInt (4 bits)
+  val n = UInt (3 bits) // how many more processing steps are needed until we're done
+
+  // These can't be inferred by an abstraction function that only looks at the implementation state!
+  // TODO wrap implementation in another module that adds ghost state
+  // val has_a = Bool() // whether a value for a has been written
+  // val has_b = Bool() // whether a value for b has been written
+}
+
 case class MultiplierIO() extends Bundle {
   // 0: first argument / result
   // 1: second argument / result overflow
@@ -29,68 +41,6 @@ case class MultiplierIO() extends Bundle {
 
   // if !isWrite, the result of the read
   val valueOut = out UInt (4 bits)
-}
-
-
-case class MultiplierSpec() extends Component {
-  val io = MultiplierIO()
-
-  /*
-  val fsm = new StateMachine {
-    val ready: State = new State with EntryPoint {
-      whenIsActive(goto(processing))
-    }
-    val processing: StateDelay = new StateDelay(cyclesCount=3) {
-      whenCompleted {
-        goto(ready)
-      }
-    }
-  }
-
-  val test: Bool = fsm.isActive(fsm.ready)
-  val test2: Bool = fsm.isActive(fsm.processing) && fsm.processing.cache.value === 2
-*/
-
-  val state = Reg(SpecState) init SpecState.READY
-  val a = Reg(UInt (4 bits))
-  val b = Reg(UInt (4 bits))
-
-  // we always drive io.valueOut -- TODO for the spec, could we leave it unspecified?
-  switch(io.addr) {
-    is(0) { io.valueOut := a }
-    is(1) { io.valueOut := b }
-    default {
-      when(state === StateType.READY) {
-        io.valueOut := 0
-      } otherwise {
-        io.valueOut := 1
-      }
-    }
-  }
-
-  switch(state) {
-    is(StateType.READY) {
-      when(io.isWrite) {
-        switch(io.addr) {
-          is(0) { a := io.valueIn }
-          is(1) { b := io.valueIn }
-          is(2) { when(io.valueIn === 1) { state := StateType.PROCESSING0 } }
-        }
-      }
-    }
-    is(StateType.PROCESSING0) {
-      state := StateType.PROCESSING1
-    }
-    is(StateType.PROCESSING1) {
-      state := StateType.PROCESSING2
-    }
-    is(StateType.PROCESSING2) {
-      val r = a * b
-      a := r(3 downto 0)
-      b := r(7 downto 4)
-      state := StateType.READY
-    }
-  }
 }
 
 case class MultiplierImpl() extends Component {
@@ -155,7 +105,8 @@ case class MultiplierImpl() extends Component {
       // b := adder.io.r(7 downto 4)
       // deliberate bug: drop highest bit of result
       b := (U"1'b0" ## adder.io.r(6 downto 4)).asUInt
-      // TODO understand output of `yosys-witness display ./simWorkspace/unamed/unamed_bmc/engine_0/trace.yw`
+      // counterexamples are best viewed using
+      // gtkwave ./simWorkspace/unamed/unamed_bmc/engine_0/trace.vcd &
 
       state := StateType.READY
     }
@@ -171,83 +122,33 @@ case class Adder() extends Component {
   io.r := io.x + io.y
 }
 
-import spinal.core.sim._
+object ProofHelpers {
 
-object MultiplierImplSim extends App {
-  val maxAllowedLatency = 10
-
-  //val compiled = Config.sim.compile(MultiplierImpl()) -- TODO why error if we reuse the compilation result?
-
-  def simWithInput(arg1: Int, arg2: Int) = Config.sim.compile(MultiplierImpl()).doSim { dut => // device under test
-    println(s"args: ${arg1} ${arg2}")
-
-    // Fork a process to generate the reset and the clock on the dut
-    dut.clockDomain.forkStimulus(period = 10)
-
-    dut.clockDomain.waitRisingEdge()
-    dut.io.addr #= 0
-    dut.io.isWrite #= true
-    dut.io.valueIn #= arg1
-
-    dut.clockDomain.waitRisingEdge()
-    dut.io.addr #= 1
-    dut.io.isWrite #= true
-    dut.io.valueIn #= arg2
-
-    dut.clockDomain.waitRisingEdge()
-    dut.io.addr #= 2
-    dut.io.isWrite #= true
-    dut.io.valueIn #= 1 // start processing
-
-    var done = false
-    var count = 0
-
-    while (count < maxAllowedLatency && !done) {
-      dut.clockDomain.waitRisingEdge()
-      dut.io.addr #= 2
-      dut.io.isWrite #= false
-      // we're testing a Mealy machine (ie output depends on current inputs),
-      // so give it half a cycle of time to propagate
-      dut.clockDomain.waitFallingEdge()
-      val isProcessing = dut.io.valueOut.toInt
-      println(s"count: ${count}, isProcessing: ${isProcessing}")
-      println(s"r = ${dut.r.toInt}")
-      if (isProcessing == 0) {
-        done = true
-      }
-      count += 1
-    }
-
-    assert(done)
-
-    dut.clockDomain.waitRisingEdge()
-    dut.io.addr #= 0
-    dut.io.isWrite #= false
-    dut.clockDomain.waitFallingEdge()
-    val loBits = dut.io.valueOut.toInt
-
-    dut.clockDomain.waitRisingEdge()
-    dut.io.addr #= 1
-    dut.io.isWrite #= false
-    dut.clockDomain.waitFallingEdge()
-    val hiBits = dut.io.valueOut.toInt
-
-    println(loBits)
-    println(hiBits)
-    assert(loBits + (hiBits << 4) == arg1 * arg2)
+  // abstraction function
+  def f(s: MultiplierImpl): SpecStateData = {
+    // TODO is there a functional way of doing this?
+    val res = SpecStateData()
+    res.state := (s.state match {
+      case StateType.READY => SpecState.READY
+      case _ => SpecState.PROCESSING
+    })
+    res.a := s.a
+    res.b := s.b
+    res.n := (s.state match {
+      case StateType.PROCESSING0 => 3
+      case StateType.PROCESSING1 => 2
+      case StateType.PROCESSING2 => 1
+      case _ => 0
+    })
+    res
   }
 
-  simWithInput(6, 7)
-  simWithInput(3, 5)
-  simWithInput(0, 6)
-  simWithInput(6, 0)
-  simWithInput(1, 1)
-  simWithInput(4, 3)
-  simWithInput(15, 15)
+  def implStateValid(s: MultiplierImpl): Bool = {
+    True
+  }
 }
 
 object MultiplierVerilog extends App {
-  Config.spinal.generateVerilog(MultiplierSpec())
   Config.spinal.generateVerilog(MultiplierImpl())
   Config.spinal.generateVerilog(Adder())
 }
@@ -260,6 +161,7 @@ case class MultiplierFormalBench() extends Component {
     val comparisonOk = out Bool()
   }
 
+  /*
   val spec = MultiplierSpec()
   val impl = MultiplierImpl()
 
@@ -267,23 +169,13 @@ case class MultiplierFormalBench() extends Component {
   impl.io.assignSomeByName(io)
 
   io.comparisonOk := (io.isWrite || (spec.io.valueOut === impl.io.valueOut))
+   */
 }
 
 import spinal.core.formal._
 
 object MultiplierFormalStepRunner extends App {
 
-  def abstractImplState(implState: StateType.C): SpecState.E =
-    implState.mux(
-      StateType.READY -> SpecState.READY,
-      default -> SpecState.PROCESSING
-    )
-
-  def R(spec: MultiplierSpec, impl: MultiplierImpl): Bool = {
-    abstractImplState(impl.state) === spec.state &&
-      impl.a === spec.a && impl.b === spec.b
-  }
-
   FormalConfig
     //.withProve() // causes yices to run forever (at least >1min)
     //.withBMC(100) // runs forever
@@ -294,7 +186,7 @@ object MultiplierFormalStepRunner extends App {
 
       // Ensure the formal test start with a reset
       assumeInitial(clockDomain.isResetActive)
-      assumeInitial(R(dut.spec, dut.impl))
+      // assumeInitial(R(dut.spec, dut.impl))
 
       // Provide some stimulus
       anyseq(dut.io.addr)
@@ -303,35 +195,8 @@ object MultiplierFormalStepRunner extends App {
 
       // to avoid disagreeing outputs before computation has taken place
       // TODO how can we specify the valid stimuli from the external world? (eg exclude reads as long as uninitialized)
-      assumeInitial(dut.spec.a === dut.impl.a)
-      assumeInitial(dut.spec.b === dut.impl.b)
-
-      // Check the state initial value and increment
-      assert(dut.io.comparisonOk)
-    })
-}
-
-object MultiplierFormalRunner extends App {
-  FormalConfig
-    //.withProve() // causes yices to run forever (at least >1min)
-    //.withBMC(100) // runs forever
-    //.withBMC(20) // 20 cycles takes a few minutes
-    .withBMC(12) // succeeds quickly
-    .doVerify(new Component {
-      val dut = FormalDut(MultiplierFormalBench())
-
-      // Ensure the formal test start with a reset
-      assumeInitial(clockDomain.isResetActive)
-
-      // Provide some stimulus
-      anyseq(dut.io.addr)
-      anyseq(dut.io.isWrite)
-      anyseq(dut.io.valueIn)
-
-      // to avoid disagreeing outputs before computation has taken place
-      // TODO how can we specify the valid stimuli from the external world? (eg exclude reads as long as uninitialized)
-      assumeInitial(dut.spec.a === dut.impl.a)
-      assumeInitial(dut.spec.b === dut.impl.b)
+      // assumeInitial(dut.spec.a === dut.impl.a)
+      // assumeInitial(dut.spec.b === dut.impl.b)
 
       // Check the state initial value and increment
       assert(dut.io.comparisonOk)
