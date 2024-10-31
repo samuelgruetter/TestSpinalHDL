@@ -26,21 +26,28 @@ case class SpecStateData() extends Bundle {
   // val has_b = Bool() // whether a value for b has been written
 }
 
-case class MultiplierIO() extends Bundle {
+case class Input() extends Bundle {
   // 0: first argument / result
   // 1: second argument / result overflow
   // 2: isProcessing (status)
   // 3: unused
-  val addr = in UInt (2 bits)
+  val addr = UInt (2 bits)
 
   // whether it's an MMIO read or write
-  val isWrite = in Bool()
+  val isWrite = Bool()
 
   // is isWrite, the value to be written, else unused
-  val valueIn = in UInt (4 bits)
+  val valueIn = UInt (4 bits)
+}
 
+case class Output() extends Bundle {
   // if !isWrite, the result of the read
-  val valueOut = out UInt (4 bits)
+  val valueOut = UInt (4 bits)
+}
+
+case class MultiplierIO() extends Bundle {
+  val input = in (Input())
+  val output = out (Output())
 }
 
 case class MultiplierImpl() extends Component {
@@ -55,25 +62,28 @@ case class MultiplierImpl() extends Component {
   r.simPublic() // for debugging
 
   // we always drive io.valueOut
-  switch(io.addr) {
-    is(0) { io.valueOut := a }
-    is(1) { io.valueOut := b }
+  switch(io.input.addr) {
+    is(0) { io.output.valueOut := a }
+    is(1) { io.output.valueOut := b }
     default {
       when(state === StateType.READY) {
-        io.valueOut := 0
+        io.output.valueOut := 0
       } otherwise {
-        io.valueOut := 1
+        io.output.valueOut := 1
       }
     }
   }
 
+  def summand(i: Int): UInt =
+    U(8 bits, (i+3 downto i) -> Mux(b(i), a, U(0)), default -> false)
+
   switch(state) {
     is(StateType.READY) {
-      when(io.isWrite) {
-        switch(io.addr) {
-          is(0) { a := io.valueIn }
-          is(1) { b := io.valueIn }
-          is(2) { when(io.valueIn === 1) { state := StateType.PROCESSING0 } }
+      when(io.input.isWrite) {
+        switch(io.input.addr) {
+          is(0) { a := io.input.valueIn }
+          is(1) { b := io.input.valueIn }
+          is(2) { when(io.input.valueIn === 1) { state := StateType.PROCESSING0 } }
         }
       }
       // We don't use the adder in this state but still need to assign its inputs to avoid creating latches
@@ -84,20 +94,20 @@ case class MultiplierImpl() extends Component {
     // so that each cycle does one addition, so only one adder is needed,
     // and  the multiplications are just Muxes because their left argument is 1 bit only
     is(StateType.PROCESSING0) {
-      adder.io.x := U(8 bits, (3 downto 0) -> Mux(b(0), a, U(0)), default -> false)
-      adder.io.y := U(8 bits, (4 downto 1) -> Mux(b(1), a, U(0)), default -> false)
+      adder.io.x := summand(0)
+      adder.io.y := summand(1)
       r := adder.io.r
       state := StateType.PROCESSING1
     }
     is(StateType.PROCESSING1) {
       adder.io.x := r
-      adder.io.y := U(8 bits, (5 downto 2) -> Mux(b(2), a, U(0)), default -> false)
+      adder.io.y := summand(2)
       r := adder.io.r
       state := StateType.PROCESSING2
     }
     is(StateType.PROCESSING2) {
       adder.io.x := r
-      adder.io.y := U(8 bits, (6 downto 3) -> Mux(b(3), a, U(0)), default -> false)
+      adder.io.y := summand(3)
       r := adder.io.r
       a := adder.io.r(3 downto 0)
 
@@ -122,6 +132,52 @@ case class Adder() extends Component {
   io.r := io.x + io.y
 }
 
+object Spec {
+  def validAddr(a: UInt): Bool = a === U(0) || a === U(1) || a === U(2)
+
+  def acceptsInput(s: SpecStateData, input: Input): Bool =
+    s.state.mux(
+      SpecState.READY ->
+        (Mux(input.isWrite, validAddr(input.addr), True) &&
+         Mux(input.isWrite && input.addr === U(2), input.valueIn === U(1), True)),
+      SpecState.PROCESSING -> (input.isWrite === False)
+    )
+
+  def isAcceptableDelay(n: UInt): Bool =
+    n === U(0) || n === U(1) || n === U(2) || n === U(3) || n === U(4)
+
+  // Only consulted if acceptsInput(s1, input) returns True.
+  // Can allow many different outputs and next states s2, and the implementation can choose any of them.
+  def step(s1: SpecStateData, input: Input, output: Output, s2: SpecStateData): Bool =
+    s1.state.mux(
+      SpecState.READY ->
+        input.isWrite.mux(
+          // it's a write
+          True -> input.addr.mux(
+            0 -> (s2.state === SpecState.READY && s2.a === input.valueIn && s2.b === s1.b),
+            1 -> (s2.state === SpecState.READY && s2.b === input.valueIn && s2.a === s1.a),
+            2 -> (s2.state === SpecState.PROCESSING && s2.a === s1.a && s2.b === s1.a && isAcceptableDelay(s2.n)),
+            default -> False
+          ),
+          // it's a read
+          False -> (s2 === s1 && input.addr.mux(
+            0 -> (output.valueOut === s1.a),
+            1 -> (output.valueOut === s1.b),
+            2 -> (output.valueOut === U(0)),
+            default -> False
+          ))
+        ),
+      SpecState.PROCESSING -> (
+        input.isWrite === False &&
+        Mux(input.addr === U(2), output.valueOut === U(1), True) &&
+        s1.n.mux(
+          0 -> (s2.state === SpecState.READY && s2.a === (s1.a * s1.b)(3 downto 0) && s2.b === (s1.a * s1.b)(7 downto 4)),
+          default -> (s2.state === SpecState.PROCESSING && s2.a === s1.a && s2.b === s1.b && s2.n === s1.n - 1)
+        )
+      )
+    )
+}
+
 object ProofHelpers {
 
   // abstraction function
@@ -143,9 +199,15 @@ object ProofHelpers {
     res
   }
 
-  def implStateValid(s: MultiplierImpl): Bool = {
-    True
-  }
+  // TODO maybe we can use k-induction to define a generic invariant that says
+  // "going k steps backwards from s is possible or hits an initial state"
+  def implStateValid(s: MultiplierImpl): Bool =
+    s.state.mux(
+      StateType.READY -> True, // TODO will need to distinguish if we're holding a result or not
+      StateType.PROCESSING0 -> (s.r === s.summand(0) + s.summand(1)),
+      StateType.PROCESSING1 -> (s.r === s.summand(0) + s.summand(1) + s.summand(2)),
+      StateType.PROCESSING2 -> (s.r === s.summand(0) + s.summand(1) + s.summand(2) + s.summand(3))
+    )
 }
 
 object MultiplierVerilog extends App {
@@ -155,21 +217,10 @@ object MultiplierVerilog extends App {
 
 case class MultiplierFormalBench() extends Component {
   val io = new Bundle {
-    val addr = in UInt (2 bits)
-    val isWrite = in Bool()
-    val valueIn = in UInt (4 bits)
-    val comparisonOk = out Bool()
+    val specState = in (SpecStateData())
   }
 
-  /*
-  val spec = MultiplierSpec()
   val impl = MultiplierImpl()
-
-  spec.io.assignSomeByName(io)
-  impl.io.assignSomeByName(io)
-
-  io.comparisonOk := (io.isWrite || (spec.io.valueOut === impl.io.valueOut))
-   */
 }
 
 import spinal.core.formal._
@@ -185,20 +236,11 @@ object MultiplierFormalStepRunner extends App {
       val dut = FormalDut(MultiplierFormalBench())
 
       // Ensure the formal test start with a reset
-      assumeInitial(clockDomain.isResetActive)
-      // assumeInitial(R(dut.spec, dut.impl))
+      // assumeInitial(clockDomain.isResetActive)
+      assumeInitial(ProofHelpers.f(dut.impl) === dut.io.specState)
+      assumeInitial(ProofHelpers.implStateValid(dut.impl))
+      assumeInitial(Spec.acceptsInput(dut.io.specState, dut.impl.io.input))
 
-      // Provide some stimulus
-      anyseq(dut.io.addr)
-      anyseq(dut.io.isWrite)
-      anyseq(dut.io.valueIn)
-
-      // to avoid disagreeing outputs before computation has taken place
-      // TODO how can we specify the valid stimuli from the external world? (eg exclude reads as long as uninitialized)
-      // assumeInitial(dut.spec.a === dut.impl.a)
-      // assumeInitial(dut.spec.b === dut.impl.b)
-
-      // Check the state initial value and increment
-      assert(dut.io.comparisonOk)
+      assert(Spec.step(past(dut.io.specState), past(dut.impl.io.input), past(dut.impl.io.output), dut.io.specState))
     })
 }
