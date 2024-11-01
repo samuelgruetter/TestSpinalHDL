@@ -234,11 +234,20 @@ object MultiplierVerilog extends App {
 
 case class MultiplierFormalBench() extends Component {
   val impl = MultiplierImpl()
-  val implState = ImplStateData()
-  implState.state := impl.state
-  implState.a := impl.a
-  implState.b := impl.b
-  implState.r := impl.r
+
+  val implState = out (ImplStateData())
+  // using .pull to work around hierarchy constraint that allows reading signals of
+  // a child component only if they are marked as out
+  implState.state := impl.state.pull()
+  implState.a := impl.a.pull()
+  implState.b := impl.b.pull()
+  implState.r := impl.r.pull()
+
+  val implInput = in (Input())
+  impl.io.input := implInput
+
+  val implOutput = out (Output())
+  implOutput := impl.io.output
 }
 
 object Lib {
@@ -256,7 +265,7 @@ object MultiplierFormalBaseCase extends App {
     .doVerify(new Component {
       val dut = FormalDut(MultiplierFormalBench())
       assumeInitial(clockDomain.isResetActive)
-      anyseq(dut.impl.io.input)
+      anyseq(dut.implInput)
       ClockDomain.current.duringReset {
         assert(implStateValid(dut.implState))
         assert(isInitialState(f(dut.implState)))
@@ -273,6 +282,8 @@ object MultiplierFormalInductiveStep extends App {
     .withBMC(12) // succeeds quickly
     .doVerify(new Component {
       val dut = FormalDut(MultiplierFormalBench())
+
+      anyseq(dut.implInput)
 
       // Note: Here we do NOT assume that there's a reset at the beginning!
 
