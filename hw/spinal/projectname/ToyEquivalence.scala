@@ -182,10 +182,23 @@ object Spec {
     )
 }
 
+// Workaround needed because SpinalHDL does not allow me to write `past(s)`
+// where `s` is a `Component`
+case class ImplStateData() extends Bundle {
+  val state = StateType()
+  val a = UInt(4 bits)
+  val b = UInt (4 bits)
+  val r = UInt (8 bits)
+
+  // duplicated
+  def summand(i: Int): UInt =
+    U(8 bits, (i+3 downto i) -> Mux(b(i), a, U(0)), default -> false)
+}
+
 object ProofHelpers {
 
   // abstraction function
-  def f(s: MultiplierImpl): SpecStateData = {
+  def f(s: ImplStateData): SpecStateData = {
     // TODO is there a functional way of doing this?
     val res = SpecStateData()
     res.state := (s.state match {
@@ -205,7 +218,7 @@ object ProofHelpers {
 
   // TODO maybe we can use k-induction to define a generic invariant that says
   // "going k steps backwards from s is possible or hits an initial state"
-  def implStateValid(s: MultiplierImpl): Bool =
+  def implStateValid(s: ImplStateData): Bool =
     s.state.mux(
       StateType.READY -> True, // TODO will need to distinguish if we're holding a result or not
       StateType.PROCESSING0 -> (s.r === s.summand(0) + s.summand(1)),
@@ -221,6 +234,11 @@ object MultiplierVerilog extends App {
 
 case class MultiplierFormalBench() extends Component {
   val impl = MultiplierImpl()
+  val implState = ImplStateData()
+  implState.state := impl.state
+  implState.a := impl.a
+  implState.b := impl.b
+  implState.r := impl.r
 }
 
 object Lib {
@@ -240,8 +258,8 @@ object MultiplierFormalBaseCase extends App {
       assumeInitial(clockDomain.isResetActive)
       anyseq(dut.impl.io.input)
       ClockDomain.current.duringReset {
-        assert(implStateValid(dut.impl))
-        assert(isInitialState(f(dut.impl)))
+        assert(implStateValid(dut.implState))
+        assert(isInitialState(f(dut.implState)))
       }
     })
 }
@@ -257,7 +275,7 @@ object MultiplierFormalInductiveStep extends App {
       val dut = FormalDut(MultiplierFormalBench())
 
       // Note: Here we do NOT assume that there's a reset at the beginning!
-      
+
       // don't run these in the first cycle, where no past(...) is available yet
       when(pastValid()) {
         // we can't use separate assume and assert statements instead of an implication,
@@ -265,11 +283,11 @@ object MultiplierFormalInductiveStep extends App {
         // second cycle, in which we want to assert stuff
         implies(
           // If in previous cycle, impl state was valid and input was acceptable according to spec, ...
-          implStateValid(past(dut.impl)) && acceptsInput(f(past(dut.impl)), past(dut.impl.io.input)),
+          implStateValid(past(dut.implState)) && acceptsInput(f(past(dut.implState)), past(dut.impl.io.input)),
           // ... then we stepped to a new impl state (with output) that the spec allows
           // and the new impl state is still valid
-          step(f(past(dut.impl)), past(dut.impl.io.input), past(dut.impl.io.output), f(dut.impl))
-            && implStateValid(dut.impl)
+          step(f(past(dut.implState)), past(dut.impl.io.input), past(dut.impl.io.output), f(dut.implState))
+            && implStateValid(dut.implState)
         )
       }
     })
