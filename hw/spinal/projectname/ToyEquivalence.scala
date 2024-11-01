@@ -201,18 +201,18 @@ object ProofHelpers {
   def f(s: ImplStateData): SpecStateData = {
     // TODO is there a functional way of doing this?
     val res = SpecStateData()
-    res.state := (s.state match {
-      case StateType.READY => SpecState.READY
-      case _ => SpecState.PROCESSING
-    })
+    res.state := s.state.mux[SpecState.C](
+      StateType.READY -> SpecState.READY,
+      default -> SpecState.PROCESSING
+    )
     res.a := s.a
     res.b := s.b
-    res.n := (s.state match {
-      case StateType.PROCESSING0 => 3
-      case StateType.PROCESSING1 => 2
-      case StateType.PROCESSING2 => 1
-      case _ => 0
-    })
+    res.n := s.state.mux[UInt](
+      StateType.PROCESSING0 -> 3,
+      StateType.PROCESSING1 -> 2,
+      StateType.PROCESSING2 -> 1,
+      default -> 0
+    )
     res
   }
 
@@ -230,6 +230,10 @@ object ProofHelpers {
 object MultiplierVerilog extends App {
   Config.spinal.generateVerilog(MultiplierImpl())
   Config.spinal.generateVerilog(Adder())
+}
+
+object PrintPruned extends App {
+  SpinalVhdl(MultiplierImpl()).printPruned()
 }
 
 case class MultiplierFormalBench() extends Component {
@@ -261,14 +265,23 @@ import Spec._
 
 object MultiplierFormalBaseCase extends App {
   FormalConfig
-    .withBMC(12)
+    .withProve()
     .doVerify(new Component {
       val dut = FormalDut(MultiplierFormalBench())
+
       assumeInitial(clockDomain.isResetActive)
+
       anyseq(dut.implInput)
+
+      // extra signals so that they show up in GTKWave
+      val testImplStateValid = Bool()
+      testImplStateValid := implStateValid(dut.implState)
+      val testIsInitialState = Bool()
+      testIsInitialState := isInitialState(f(dut.implState))
+
       ClockDomain.current.duringReset {
-        assert(implStateValid(dut.implState))
-        assert(isInitialState(f(dut.implState)))
+        assert(testImplStateValid)
+        assert(testIsInitialState)
       }
     })
 }
@@ -276,12 +289,11 @@ object MultiplierFormalBaseCase extends App {
 object MultiplierFormalInductiveStep extends App {
 
     FormalConfig
-    //.withProve() // causes yices to run forever (at least >1min)
-    //.withBMC(100) // runs forever
-    //.withBMC(20) // 20 cycles takes a few minutes
-    .withBMC(12) // succeeds quickly
+    .withProve()
     .doVerify(new Component {
       val dut = FormalDut(MultiplierFormalBench())
+
+      // SpinalVhdl(dut).printPruned() // TODO null-pointer exception (maybe due to signal being used before defined?)
 
       anyseq(dut.implInput)
 
