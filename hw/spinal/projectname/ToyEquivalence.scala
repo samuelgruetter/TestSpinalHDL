@@ -133,6 +133,10 @@ case class Adder() extends Component {
 }
 
 object Spec {
+
+  def isInitialState(s: SpecStateData): Bool =
+    s.state === SpecState.READY
+
   def validAddr(a: UInt): Bool = a === U(0) || a === U(1) || a === U(2)
 
   def acceptsInput(s: SpecStateData, input: Input): Bool =
@@ -216,18 +220,35 @@ object MultiplierVerilog extends App {
 }
 
 case class MultiplierFormalBench() extends Component {
-  val io = new Bundle {
-    val specState = in (SpecStateData())
-  }
-
   val impl = MultiplierImpl()
 }
 
+object Lib {
+  def implies(a: Bool, b: Bool): Bool = (!a) || b
+}
+
 import spinal.core.formal._
+import Lib._
+import ProofHelpers._
+import Spec._
 
-object MultiplierFormalStepRunner extends App {
-
+object MultiplierFormalBaseCase extends App {
   FormalConfig
+    .withBMC(12)
+    .doVerify(new Component {
+      val dut = FormalDut(MultiplierFormalBench())
+      assumeInitial(clockDomain.isResetActive)
+      anyseq(dut.impl.io.input)
+      ClockDomain.current.duringReset {
+        assert(implStateValid(dut.impl))
+        assert(isInitialState(f(dut.impl)))
+      }
+    })
+}
+
+object MultiplierFormalInductiveStep extends App {
+
+    FormalConfig
     //.withProve() // causes yices to run forever (at least >1min)
     //.withBMC(100) // runs forever
     //.withBMC(20) // 20 cycles takes a few minutes
@@ -235,12 +256,21 @@ object MultiplierFormalStepRunner extends App {
     .doVerify(new Component {
       val dut = FormalDut(MultiplierFormalBench())
 
-      // Ensure the formal test start with a reset
-      // assumeInitial(clockDomain.isResetActive)
-      assumeInitial(ProofHelpers.f(dut.impl) === dut.io.specState)
-      assumeInitial(ProofHelpers.implStateValid(dut.impl))
-      assumeInitial(Spec.acceptsInput(dut.io.specState, dut.impl.io.input))
-
-      assert(Spec.step(past(dut.io.specState), past(dut.impl.io.input), past(dut.impl.io.output), dut.io.specState))
+      // Note: Here we do NOT assume that there's a reset at the beginning!
+      
+      // don't run these in the first cycle, where no past(...) is available yet
+      when(pastValid()) {
+        // we can't use separate assume and assert statements instead of an implication,
+        // because the separate assume statements would apply to each cycle, including the
+        // second cycle, in which we want to assert stuff
+        implies(
+          // If in previous cycle, impl state was valid and input was acceptable according to spec, ...
+          implStateValid(past(dut.impl)) && acceptsInput(f(past(dut.impl)), past(dut.impl.io.input)),
+          // ... then we stepped to a new impl state (with output) that the spec allows
+          // and the new impl state is still valid
+          step(f(past(dut.impl)), past(dut.impl.io.input), past(dut.impl.io.output), f(dut.impl))
+            && implStateValid(dut.impl)
+        )
+      }
     })
 }
