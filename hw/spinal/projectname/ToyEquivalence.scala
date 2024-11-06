@@ -304,14 +304,14 @@ object MultiplierFormalInductiveStep extends App {
         // we can't use separate assume and assert statements instead of an implication,
         // because the separate assume statements would apply to each cycle, including the
         // second cycle, in which we want to assert stuff
-        implies(
+        assert(implies(
           // If in previous cycle, impl state was valid and input was acceptable according to spec, ...
           implStateValid(past(dut.implState)) && acceptsInput(f(past(dut.implState)), past(dut.impl.io.input)),
           // ... then we stepped to a new impl state (with output) that the spec allows
           // and the new impl state is still valid
           step(f(past(dut.implState)), past(dut.impl.io.input), past(dut.impl.io.output), f(dut.implState))
             && implStateValid(dut.implState)
-        )
+        ))
       }
     })
 }
