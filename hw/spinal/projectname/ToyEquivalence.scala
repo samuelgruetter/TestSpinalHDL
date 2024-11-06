@@ -208,10 +208,10 @@ object ProofHelpers {
     res.a := s.a
     res.b := s.b
     res.n := s.state.mux[UInt](
-      StateType.PROCESSING0 -> 3,
-      StateType.PROCESSING1 -> 2,
-      StateType.PROCESSING2 -> 1,
-      default -> 0
+      StateType.PROCESSING0 -> U(3, 3 bits),
+      StateType.PROCESSING1 -> U(2, 3 bits),
+      StateType.PROCESSING2 -> U(1, 3 bits),
+      default -> U(0, 3 bits)
     )
     res
   }
